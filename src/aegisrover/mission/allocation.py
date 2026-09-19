@@ -101,6 +101,22 @@ class ReservationBook:
             accepted.append(item)
         return accepted
 
+    def plan(self, requests, *, now: float = 0.0, commit: bool = True):
+        """Plan a batch of :class:`~aegisrover.mission.batch.Request` at once.
+
+        Unlike :meth:`schedule`, contention never raises: the returned
+        :class:`~aegisrover.mission.batch.Plan` records who goes first and
+        why, per-robot waiting times, and explicit rejections. With
+        ``commit=True`` (the default) every scheduled window is reserved in
+        this book; pass ``commit=False`` to preview a plan without taking it.
+        """
+        from aegisrover.mission.batch import plan_batch
+        plan = plan_batch(requests, existing=self.items(), now=now)
+        if commit:
+            for entry in plan.entries:
+                self.reserve(entry.reservation())
+        return plan
+
     # -- queries ---------------------------------------------------------------
     def items(self) -> tuple[Reservation, ...]:
         return tuple(sorted(self._items))

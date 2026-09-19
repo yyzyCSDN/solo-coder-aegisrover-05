@@ -2,6 +2,7 @@
 import pytest
 
 from aegisrover.mission.allocation import Conflict, Deadlock, Reservation, ReservationBook
+from aegisrover.mission.batch import Request, plan_batch
 from aegisrover.mission.lifecycle import InvalidTransition, MissionService
 from aegisrover.storage.audit import AuditLog
 from aegisrover.storage.repository import NotFound, Repository, VersionConflict
@@ -151,3 +152,89 @@ def test_wait_for_graph_reports_circular_wait():
         book.require_no_deadlock()
     book.clear_wait('robot-2')
     assert book.detect_deadlock() is None
+
+
+def test_batch_plan_orders_contended_resource_and_reports_waits():
+    plan = plan_batch([
+        Request('robot-1', 'door-a', earliest=10.0, duration=2.0, enqueued_at=9.0),
+        Request('robot-2', 'door-a', earliest=10.0, duration=2.0, enqueued_at=5.0),
+        Request('robot-3', 'dock', earliest=10.0, duration=1.0, enqueued_at=8.0),
+    ], now=10.0)
+    # robot-2 has been waiting longer, so it takes the door first; robot-1
+    # starts at the exact instant robot-2 releases it (half-open windows).
+    assert (plan.entry_for('robot-2').start, plan.entry_for('robot-2').end) == (10.0, 12.0)
+    assert (plan.entry_for('robot-1').start, plan.entry_for('robot-1').end) == (12.0, 14.0)
+    assert plan.entry_for('robot-1').wait == 2.0
+    assert plan.entry_for('robot-1').behind == ('robot-2',)
+    assert plan.entry_for('robot-3').wait == 0.0
+    decision = plan.decisions[0]
+    assert (decision.resource, decision.first, decision.then, decision.rule) == (
+        'door-a', 'robot-2', 'robot-1', 'starvation')
+    assert plan.wait_times() == {'robot-1': 2.0, 'robot-2': 0.0, 'robot-3': 0.0}
+    assert plan.starvation()[0] == ('robot-2', 5.0)
+    assert not plan.rejections
+    assert 'robot-2 before robot-1' in plan.summary()
+    # Deterministic: the same batch always yields the same plan.
+    again = plan_batch([
+        Request('robot-1', 'door-a', earliest=10.0, duration=2.0, enqueued_at=9.0),
+        Request('robot-2', 'door-a', earliest=10.0, duration=2.0, enqueued_at=5.0),
+        Request('robot-3', 'dock', earliest=10.0, duration=1.0, enqueued_at=8.0),
+    ], now=10.0)
+    assert again == plan
+
+
+def test_batch_plan_decision_rule_precedence():
+    # Priority outranks even a much longer wait.
+    plan = plan_batch([
+        Request('robot-1', 'door-a', 0.0, 1.0, priority=1, enqueued_at=-100.0),
+        Request('robot-2', 'door-a', 0.0, 1.0, priority=5, enqueued_at=0.0),
+    ], now=0.0)
+    assert plan.decisions[0].rule == 'priority'
+    assert plan.decisions[0].first == 'robot-2'
+    # Equal priority and wait: earliest deadline goes first.
+    plan = plan_batch([
+        Request('robot-1', 'door-a', 0.0, 1.0, deadline=50.0),
+        Request('robot-2', 'door-a', 0.0, 1.0, deadline=10.0),
+    ], now=0.0)
+    assert plan.decisions[0].rule == 'deadline'
+    assert plan.decisions[0].first == 'robot-2'
+    # A full tie is broken deterministically by robot id.
+    plan = plan_batch([
+        Request('robot-b', 'door-a', 0.0, 1.0),
+        Request('robot-a', 'door-a', 0.0, 1.0),
+    ])
+    assert plan.decisions[0].rule == 'id'
+    assert plan.decisions[0].first == 'robot-a'
+
+
+def test_batch_plan_rejects_impossible_request_without_failing_batch():
+    plan = plan_batch([
+        Request('robot-1', 'door-a', earliest=10.0, duration=5.0, deadline=20.0),
+        Request('robot-2', 'door-a', earliest=20.0, duration=5.0),
+    ], existing=[Reservation('door-a', 'robot-9', 10.0, 20.0)], now=10.0)
+    # robot-1 cannot fit before its deadline, but that must not sink robot-2.
+    assert [r.request.robot for r in plan.rejections] == ['robot-1']
+    rejection = plan.rejections[0]
+    assert rejection.blockers == ('robot-9',)
+    assert 'deadline' in rejection.reason
+    assert (plan.entry_for('robot-2').start, plan.entry_for('robot-2').end) == (20.0, 25.0)
+    # A rejected robot still shows up in the starvation ranking.
+    assert 'robot-1' in dict(plan.starvation())
+
+
+def test_reservation_book_plans_and_commits_batch():
+    book = ReservationBook()
+    book.reserve(Reservation('door-a', 'robot-9', 10.0, 12.0))
+    plan = book.plan([
+        Request('robot-1', 'door-a', earliest=10.0, duration=2.0),
+        Request('robot-2', 'door-a', earliest=10.0, duration=2.0, priority=5),
+    ], now=10.0)
+    assert plan.decisions[0].rule == 'priority'
+    scheduled = sorted(book.usage('door-a'), key=lambda r: r.start)
+    assert [(r.holder, r.start, r.end) for r in scheduled] == [
+        ('robot-9', 10.0, 12.0), ('robot-2', 12.0, 14.0), ('robot-1', 14.0, 16.0)]
+    # A preview plans against the book but leaves it untouched.
+    preview = book.plan([Request('robot-3', 'door-a', earliest=10.0, duration=1.0)],
+                        now=10.0, commit=False)
+    assert preview.entry_for('robot-3').start == 16.0
+    assert {r.holder for r in book.usage('door-a')} == {'robot-1', 'robot-2', 'robot-9'}
