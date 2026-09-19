@@ -1,6 +1,7 @@
 """Storage, audit and mission-domain acceptance tests for the v1.1 platform."""
 import pytest
 
+from aegisrover.mission import reservations
 from aegisrover.mission.allocation import Conflict, Deadlock, Reservation, ReservationBook
 from aegisrover.mission.lifecycle import InvalidTransition, MissionService
 from aegisrover.storage.audit import AuditLog
@@ -151,3 +152,75 @@ def test_wait_for_graph_reports_circular_wait():
         book.require_no_deadlock()
     book.clear_wait('robot-2')
     assert book.detect_deadlock() is None
+
+
+def test_batch_plan_serialises_door_contention_with_explanations():
+    result = reservations.plan([
+        reservations.Request('robot-1', 'door-a', earliest=10.0, duration=2.0, priority=1, submitted=5.0),
+        reservations.Request('robot-2', 'door-a', earliest=10.5, duration=2.0, priority=5, submitted=6.0),
+        reservations.Request('robot-3', 'door-a', earliest=11.0, duration=1.0, priority=1, submitted=1.0),
+    ])
+    # One feasible schedule: highest priority first, then the longest-waiting.
+    assert reservations.feasible(result.slots)
+    assert [(s.robot, s.start, s.end) for s in result.slots] == [
+        ('robot-2', 10.5, 12.5), ('robot-3', 12.5, 13.5), ('robot-1', 13.5, 15.5)]
+    # Every delay is explained by who goes first and why.
+    assert [(d.first, d.then) for d in result.decisions] == [
+        ('robot-2', 'robot-3'), ('robot-2', 'robot-1'), ('robot-3', 'robot-1')]
+    assert 'priority 5 beats 1' in result.decisions[0].reason
+    assert 'waited longer' in result.decisions[2].reason
+    # Each robot's wait is reported and the most-starved one is visible.
+    assert result.waits == {'robot-2': 0.0, 'robot-3': 1.5, 'robot-1': 3.5}
+    assert result.longest_waiting == ('robot-1', 3.5)
+
+
+def test_batch_plan_anti_starvation_tie_break():
+    result = reservations.plan([
+        reservations.Request('newcomer', 'dock-1', earliest=0.0, duration=4.0, priority=2, submitted=100.0),
+        reservations.Request('veteran', 'dock-1', earliest=0.0, duration=4.0, priority=2, submitted=10.0),
+    ])
+    assert result.waits == {'veteran': 0.0, 'newcomer': 4.0}
+    decision, = result.decisions
+    assert (decision.first, decision.then) == ('veteran', 'newcomer')
+    assert 'waited longer' in decision.reason
+
+
+def test_batch_plan_respects_existing_reservations():
+    existing = [reservations.Reservation('robot-9', 'door-a', 10.0, 12.0)]
+    result = reservations.plan(
+        [reservations.Request('robot-1', 'door-a', earliest=10.5, duration=1.0)], existing)
+    slot, = result.slots
+    assert (slot.start, slot.end, slot.wait) == (12.0, 13.0, 1.5)
+    decision, = result.decisions
+    assert (decision.first, decision.then) == ('robot-9', 'robot-1')
+    assert 'already reserved [10, 12)' in decision.reason
+    assert reservations.feasible(result.slots, existing)
+
+
+def test_batch_plan_resources_are_independent():
+    result = reservations.plan([
+        reservations.Request('robot-1', 'door-a', earliest=0.0, duration=5.0),
+        reservations.Request('robot-2', 'dock-1', earliest=0.0, duration=5.0),
+    ])
+    assert result.waits == {'robot-1': 0.0, 'robot-2': 0.0}
+    assert result.decisions == ()
+
+
+def test_batch_plan_is_committable_and_empty_batch_is_trivial():
+    result = reservations.plan([
+        reservations.Request('robot-1', 'door-a', earliest=0.0, duration=2.0),
+        reservations.Request('robot-2', 'door-a', earliest=0.0, duration=2.0),
+        reservations.Request('robot-2', 'dock-1', earliest=1.0, duration=3.0),
+    ])
+    book = []
+    for reservation in result.as_reservations():
+        book = reservations.reserve(book, reservation)  # planned slots never conflict
+    assert len(book) == 3
+    empty = reservations.plan([])
+    assert empty.slots == () and empty.decisions == () and empty.waits == {}
+    assert empty.longest_waiting is None
+
+
+def test_batch_plan_rejects_a_negative_duration():
+    with pytest.raises(ValueError):
+        reservations.Request('robot-1', 'door-a', earliest=0.0, duration=-1.0)
